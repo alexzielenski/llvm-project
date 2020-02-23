@@ -104,6 +104,11 @@
                     "type": "boolean",
                     "default": "true",
                     "description": "Enable semantic highlighting in clangd"
+                },
+                "clangd.rainbowSemanticHighlighting": {
+                    "type": "boolean",
+                    "default": "false",
+                    "description": "Enable rainbow semantic highlighting in clangd. Has no effect is semanticHighlighting isn't enabled."
                 }
             }
         },

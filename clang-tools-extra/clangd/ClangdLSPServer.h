@@ -207,6 +207,8 @@ private:
   bool SupportsOffsetsInSignatureHelp = false;
   // Store of the current versions of the open documents.
   DraftStore DraftMgr;
+  /// Whether to send SymbolID hashes along with tokens.
+  bool SupportsRainbowHighlighting = false;
 
   // The CDB is created by the "initialize" LSP method.
   bool UseDirBasedCDB;                     // FIXME: make this a capability.

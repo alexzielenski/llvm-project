@@ -464,6 +464,9 @@ struct InitializationOptions {
 
   /// Clients supports show file status for textDocument/clangd.fileStatus.
   bool FileStatus = false;
+
+  // Whether the client requests rainbow semantic highighting to be enabled
+  bool RainbowSemanticHighlighting = false;
 };
 bool fromJSON(const llvm::json::Value &, InitializationOptions &);
 

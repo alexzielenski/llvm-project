@@ -950,6 +950,7 @@ bool fromJSON(const llvm::json::Value &Params, InitializationOptions &Opts) {
   O.map("compilationDatabasePath", Opts.compilationDatabasePath);
   O.map("fallbackFlags", Opts.fallbackFlags);
   O.map("clangdFileStatus", Opts.FileStatus);
+  O.map("rainbowSemanticHighlighting", Opts.RainbowSemanticHighlighting);
   return true;
 }
 

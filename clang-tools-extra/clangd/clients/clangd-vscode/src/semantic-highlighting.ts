@@ -33,6 +33,8 @@ interface SemanticHighlightingToken {
   length: number;
   // The TextMate scope index to the clangd scope lookup table.
   scopeIndex: number;
+  // Hash of the SymbolID for this reference, or 0 if not applicable
+  instance?: number;
 }
 // A line of decoded highlightings from the data clangd sent.
 export interface SemanticHighlightingLine {
@@ -83,9 +85,19 @@ export class SemanticHighlightingFeature implements vscodelc.StaticFeature {
   }
 
   async loadCurrentTheme() {
+    interface TokenColors {
+      textMateRules?: { scope: string, settings: {foreground: string}}[]
+    }
+    const seenScopes = new Set<string>();
+    const overrides = vscode.workspace.getConfiguration('editor')
+          .get<TokenColors>('tokenColorCustomizations').textMateRules || [];
+    const overrideRules = mapThemeToRules(overrides, seenScopes);
+    const rules = await loadTheme(vscode.workspace.getConfiguration('workbench')
+          .get<string>('colorTheme'), seenScopes);
     const themeRuleMatcher = new ThemeRuleMatcher(
-        await loadTheme(vscode.workspace.getConfiguration('workbench')
-                            .get<string>('colorTheme')));
+      [...overrideRules, ...rules]
+    );
+
     this.highlighter.initialize(themeRuleMatcher);
   }
 
@@ -107,7 +119,8 @@ export class SemanticHighlightingFeature implements vscodelc.StaticFeature {
     // Adds a listener to reload the theme when it changes.
     this.subscriptions.push(
         vscode.workspace.onDidChangeConfiguration((conf) => {
-          if (!conf.affectsConfiguration('workbench.colorTheme'))
+          if (!conf.affectsConfiguration('workbench.colorTheme') &&
+              !conf.affectsConfiguration('editor.tokenColorCustomizations'))
             return;
           this.loadCurrentTheme();
         }));
@@ -136,7 +149,7 @@ export class SemanticHighlightingFeature implements vscodelc.StaticFeature {
 // Converts a string of base64 encoded tokens into the corresponding array of
 // HighlightingTokens.
 export function decodeTokens(tokens: string): SemanticHighlightingToken[] {
-  const scopeMask = 0xFFFF;
+  const scopeMask = 0x00FF;
   const lenShift = 0x10;
   const uint32Size = 4;
   const buf = Buffer.from(tokens, 'base64');
@@ -146,7 +159,9 @@ export function decodeTokens(tokens: string): SemanticHighlightingToken[] {
     const lenKind = buf.readUInt32BE((i + 1) * uint32Size);
     const scopeIndex = lenKind & scopeMask;
     const len = lenKind >>> lenShift;
-    retTokens.push({character : start, scopeIndex : scopeIndex, length : len});
+    const symbolID = (lenKind & 0x0000FF00) >>> 8;
+    retTokens.push({character : start, scopeIndex : scopeIndex, length : len,
+                    instance: symbolID * 31});
   }
 
   return retTokens;
@@ -157,10 +172,11 @@ export function decodeTokens(tokens: string): SemanticHighlightingToken[] {
 export class Highlighter {
   // Maps uris with currently open TextDocuments to the current highlightings.
   private files: Map<string, Map<number, SemanticHighlightingLine>> = new Map();
+  private filesVersions: Map<string, number> = new Map();
   // DecorationTypes for the current theme that are used when highlighting. A
   // SemanticHighlightingToken with scopeIndex i should have the decoration at
   // index i in this list.
-  private decorationTypes: vscode.TextEditorDecorationType[] = [];
+  private decorationTypes: vscode.TextEditorDecorationType[][] = [];
   // The clangd TextMate scope lookup table.
   private scopeLookupTable: string[][];
   constructor(scopeLookupTable: string[][]) {
@@ -168,7 +184,7 @@ export class Highlighter {
   }
   public dispose() {
     this.files.clear();
-    this.decorationTypes.forEach((t) => t.dispose());
+    this.decorationTypes.forEach((ts) => ts.forEach((t) => t.dispose()));
     // Dispose must not be not called multiple times if initialize is
     // called again.
     this.decorationTypes = [];
@@ -179,18 +195,29 @@ export class Highlighter {
   // theme changes and has been loaded. Should also be called when the first
   // theme is loaded.
   public initialize(themeRuleMatcher: ThemeRuleMatcher) {
-    this.decorationTypes.forEach((t) => t.dispose());
+    this.decorationTypes.forEach((ts) => ts.forEach((t) => t.dispose()));
     this.decorationTypes = this.scopeLookupTable.map((scopes) => {
-      const options: vscode.DecorationRenderOptions = {
-        // If there exists no rule for this scope the matcher returns an empty
-        // color. That's ok because vscode does not do anything when applying
-        // empty decorations.
-        color : themeRuleMatcher.getBestThemeRule(scopes[0]).foreground,
-        // If the rangeBehavior is set to Open in any direction the
-        // highlighting becomes weird in certain cases.
-        rangeBehavior : vscode.DecorationRangeBehavior.ClosedClosed,
-      };
-      return vscode.window.createTextEditorDecorationType(options);
+      const best = themeRuleMatcher.getBestThemeRule(scopes[0]);
+      let elems: string[];
+      if (!!best.rainbow) {
+        elems = best.rainbow;
+      } else {
+        elems = [best.foreground];
+      }
+
+      return elems.map((color) => {
+        const options: vscode.DecorationRenderOptions = {
+          // If there exists no rule for this scope the matcher returns an empty
+          // color. That's ok because vscode does not do anything when applying
+          // empty decorations.
+          color : color,
+          // If the rangeBehavior is set to Open in any direction the
+          // highlighting becomes weird in certain cases.
+          rangeBehavior : vscode.DecorationRangeBehavior.ClosedClosed,
+        };
+
+        return vscode.window.createTextEditorDecorationType(options);
+      })
     });
     this.getVisibleTextEditorUris().forEach((fileUri) =>
                                                 this.applyHighlights(fileUri));
@@ -228,7 +255,11 @@ export class Highlighter {
     vscode.window.visibleTextEditors.forEach((e) => {
       if (e.document.uri.toString() !== fileUriStr)
         return;
-      this.decorationTypes.forEach((d, i) => e.setDecorations(d, ranges[i]));
+      this.decorationTypes.forEach((d, i) => {
+        d.forEach((d2, i2) => {
+          e.setDecorations(d2, ranges[i][i2])
+        })
+      });
     });
   }
 
@@ -246,19 +277,24 @@ export class Highlighter {
 
   // Returns the ranges that should be used when decorating. Index i in the
   // range array has the decoration type at index i of this.decorationTypes.
-  protected getDecorationRanges(fileUri: vscode.Uri): vscode.Range[][] {
+  protected getDecorationRanges(fileUri: vscode.Uri): vscode.Range[][][] {
     const fileUriStr = fileUri.toString();
     if (!this.files.has(fileUriStr))
       // this.files should always have an entry for fileUri if we are here. But
       // if there isn't one we don't want to crash the extension. This is also
       // useful for tests.
       return [];
-    const lines: SemanticHighlightingLine[] =
-        Array.from(this.files.get(fileUriStr).values());
-    const decorations: vscode.Range[][] = this.decorationTypes.map(() => []);
-    lines.forEach((line) => {
+    const decorations: vscode.Range[][][] = this.decorationTypes.map((i) => {
+      let res = new Array(i.length);
+      for (let c = 0; c < i.length; c++) {
+        res[c] = [];
+      }
+      return res;
+    });
+    this.files.get(fileUriStr).forEach((line) => {
       line.tokens.forEach((token) => {
-        decorations[token.scopeIndex].push(new vscode.Range(
+        const id = (token.instance || 0) % decorations[token.scopeIndex].length;
+        decorations[token.scopeIndex][id].push(new vscode.Range(
             new vscode.Position(line.line, token.character),
             new vscode.Position(line.line, token.character + token.length)));
       });
@@ -274,6 +310,8 @@ interface TokenColorRule {
   scope: string;
   // foreground is the color tokens of this scope should have.
   foreground: string;
+
+  rainbow?: string[];
 }
 
 export class ThemeRuleMatcher {
@@ -310,7 +348,7 @@ export class ThemeRuleMatcher {
 }
 
 // Get all token color rules provided by the theme.
-function loadTheme(themeName: string): Promise<TokenColorRule[]> {
+function loadTheme(themeName: string, seenScopes?: Set<string>): Promise<TokenColorRule[]> {
   const extension =
       vscode.extensions.all.find((extension: vscode.Extension<any>) => {
         const contribs = extension.packageJSON.contributes;
@@ -326,7 +364,44 @@ function loadTheme(themeName: string): Promise<TokenColorRule[]> {
 
   const themeInfo = extension.packageJSON.contributes.themes.find(
       (theme: any) => theme.id === themeName || theme.label === themeName);
-  return parseThemeFile(path.join(extension.extensionPath, themeInfo.path));
+  return parseThemeFile(path.join(extension.extensionPath, themeInfo.path),
+                        seenScopes);
+}
+
+function mapThemeToRules(
+  parsed: any[],
+  seenScopes?: Set<string>
+): TokenColorRule[] {
+  const rules: TokenColorRule[] = [];
+  parsed.forEach((rule: any) => {
+    if (!rule.scope || !rule.settings || (
+              !rule.settings.foreground && (
+                !rule.settings.rainbow ||
+                rule.settings.rainbow.length == 0))
+        ) {
+      return;
+    }
+    const textColor = rule.settings.foreground;
+    // Scopes that were found further up the TextMate chain should not be
+    // overwritten.
+    const addColor = (scope: string) => {
+      if (seenScopes.has(scope))
+        return;
+      let rainbow = [textColor]
+      if (!!rule.settings.rainbow) {
+        let c = rule.settings.rainbow as any[];
+        rainbow = c.map((elem) => elem.foreground);
+      }
+      rules.push({scope, foreground : textColor, rainbow});
+      seenScopes.add(scope);
+    };
+    if (rule.scope instanceof Array) {
+      return rule.scope.forEach((s: string) => addColor(s));
+    }
+    addColor(rule.scope);
+  });
+
+  return rules;
 }
 
 /**
@@ -347,28 +422,12 @@ export async function parseThemeFile(
   try {
     const contents = await readFileText(fullPath);
     const parsed = jsonc.parse(contents);
-    const rules: TokenColorRule[] = [];
     // To make sure it does not crash if tokenColors is undefined.
     if (!parsed.tokenColors)
       parsed.tokenColors = [];
-    parsed.tokenColors.forEach((rule: any) => {
-      if (!rule.scope || !rule.settings || !rule.settings.foreground)
-        return;
-      const textColor = rule.settings.foreground;
-      // Scopes that were found further up the TextMate chain should not be
-      // overwritten.
-      const addColor = (scope: string) => {
-        if (seenScopes.has(scope))
-          return;
-        rules.push({scope, foreground : textColor});
-        seenScopes.add(scope);
-      };
-      if (rule.scope instanceof Array) {
-        return rule.scope.forEach((s: string) => addColor(s));
-      }
-      addColor(rule.scope);
-    });
 
+    const rules: TokenColorRule[] = mapThemeToRules(parsed.tokenColors,
+                                                    seenScopes);
     if (parsed.include)
       // Get all includes and merge into a flat list of parsed json.
       return [

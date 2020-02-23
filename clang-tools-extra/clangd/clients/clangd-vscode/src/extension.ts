@@ -82,7 +82,7 @@ export function activate(context: vscode.ExtensionContext) {
     clangd.options = {env : {...process.env, ...trace}};
   }
   const serverOptions: vscodelc.ServerOptions = clangd;
-
+  const rainbowEnabled = getConfig<boolean>('rainbowSemanticHighlighting');
   const clientOptions: vscodelc.LanguageClientOptions = {
         // Register the server for c-family and cuda files.
         documentSelector: [
@@ -96,7 +96,8 @@ export function activate(context: vscode.ExtensionContext) {
         synchronize: !syncFileEvents ? undefined : {
         // FIXME: send sync file events when clangd provides implementations.
         },
-        initializationOptions: { clangdFileStatus: true },
+        initializationOptions: { clangdFileStatus: true,
+                                 rainbowSemanticHighlighting: rainbowEnabled },
         // Do not switch to output window when clangd returns output
         revealOutputChannelOn: vscodelc.RevealOutputChannelOn.Never
     };

@@ -467,6 +467,8 @@ void ClangdLSPServer::onInitialize(const InitializeParams &Params,
       }
   }
 
+  SupportsRainbowHighlighting =
+      Params.initializationOptions.RainbowSemanticHighlighting;
   ClangdServerOpts.SemanticHighlighting =
       Params.capabilities.SemanticHighlighting;
   if (Params.rootUri && *Params.rootUri)
@@ -1351,7 +1353,7 @@ void ClangdLSPServer::onHighlightingsReady(
   std::vector<LineHighlightings> Diffed = diffHighlightings(Highlightings, Old);
   publishSemanticHighlighting(
       {{URIForFile::canonicalize(File, /*TUPath=*/File)},
-       toSemanticHighlightingInformation(Diffed)});
+       toSemanticHighlightingInformation(Diffed, SupportsRainbowHighlighting)});
 }
 
 void ClangdLSPServer::onDiagnosticsReady(PathRef File,

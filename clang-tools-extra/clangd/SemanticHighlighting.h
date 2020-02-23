@@ -56,6 +56,9 @@ llvm::raw_ostream &operator<<(llvm::raw_ostream &OS, HighlightingKind K);
 struct HighlightingToken {
   HighlightingKind Kind;
   Range R;
+  unsigned SymbolID = 0;
+
+  HighlightingToken(HighlightingKind Kind, Range R, unsigned SymbolID = 0): Kind(Kind), R(R), SymbolID(SymbolID) {}
 };
 
 bool operator==(const HighlightingToken &L, const HighlightingToken &R);
@@ -80,7 +83,7 @@ llvm::StringRef toTextMateScope(HighlightingKind Kind);
 
 /// Convert to LSP's semantic highlighting information.
 std::vector<SemanticHighlightingInformation>
-toSemanticHighlightingInformation(llvm::ArrayRef<LineHighlightings> Tokens);
+toSemanticHighlightingInformation(llvm::ArrayRef<LineHighlightings> Tokens, bool ExtendWithSymbolIDs = false);
 
 /// Return a line-by-line diff between two highlightings.
 ///  - if the tokens on a line are the same in both highlightings, this line is

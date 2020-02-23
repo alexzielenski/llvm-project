@@ -7,11 +7,13 @@
 //===----------------------------------------------------------------------===//
 
 #include "SemanticHighlighting.h"
+#include "AST.h"
 #include "FindTarget.h"
 #include "Logger.h"
 #include "ParsedAST.h"
 #include "Protocol.h"
 #include "SourceCode.h"
+#include "index/SymbolID.h"
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/Decl.h"
 #include "clang/AST/DeclCXX.h"
@@ -125,6 +127,41 @@ llvm::Optional<HighlightingKind> kindForReference(const ReferenceLoc &R) {
   return Result;
 }
 
+unsigned symbolIDForReference(const ReferenceLoc &R) {
+  llvm::Optional<SymbolID> Result;
+  for (const NamedDecl *Decl : R.Targets) {
+    if (!canHighlightName(Decl->getDeclName()))
+      return 0;
+    if (auto *USD = dyn_cast<UsingShadowDecl>(Decl)) {
+      if (auto *Target = USD->getTargetDecl())
+        Decl = Target;
+    }
+    if (auto *TD = dyn_cast<TemplateDecl>(Decl)) {
+      if (auto *Templated = TD->getTemplatedDecl())
+        Decl = Templated;
+    }
+    if (auto* CTSD = dyn_cast<ClassTemplateSpecializationDecl>(Decl)) {
+      if (auto* Specialized = CTSD->getSpecializedTemplate()) {
+        if (auto* Templated = Specialized->getTemplatedDecl()) {
+          Decl = Templated;
+        }
+      }
+    }
+    if (auto* VTSD = dyn_cast<VarTemplateSpecializationDecl>(Decl)) {
+      if (auto* Specialized = VTSD->getSpecializedTemplate()) {
+        if (auto* Templated = Specialized->getTemplatedDecl()) {
+          Decl = Templated;
+        }
+      }
+    }
+    auto Hash = getSymbolID(Decl);
+    if (!Hash || (Result  && Hash != Result))
+      return 0;
+    Result = *Hash;
+  }
+  return static_cast<unsigned>(hash_value(*Result));
+}
+
 /// Consumes source locations and maps them to text ranges for highlightings.
 class HighlightingsBuilder {
 public:
@@ -134,7 +171,7 @@ public:
 
   void addToken(HighlightingToken T) { Tokens.push_back(T); }
 
-  void addToken(SourceLocation Loc, HighlightingKind Kind) {
+  void addToken(SourceLocation Loc, HighlightingKind Kind, unsigned SymbolID = 0) {
     if (Loc.isInvalid())
       return;
     if (Loc.isMacroID()) {
@@ -158,7 +195,7 @@ public:
       elog("Tried to add semantic token with an invalid range");
       return;
     }
-    Tokens.push_back(HighlightingToken{Kind, *Range});
+    Tokens.push_back(HighlightingToken{Kind, *Range, SymbolID});
   }
 
   std::vector<HighlightingToken> collect(ParsedAST &AST) && {
@@ -281,35 +318,63 @@ private:
   HighlightingsBuilder &H;
 };
 
+static const std::string base64_chars =
+             "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+             "abcdefghijklmnopqrstuvwxyz"
+             "0123456789+/";
+
+
 // Encode binary data into base64.
 // This was copied from compiler-rt/lib/fuzzer/FuzzerUtil.cpp.
 // FIXME: Factor this out into llvm/Support?
+//
+// Temporary implementation from:
+// https://github.com/ReneNyffenegger/cpp-base64/
 std::string encodeBase64(const llvm::SmallVectorImpl<char> &Bytes) {
-  static const char Table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-                              "abcdefghijklmnopqrstuvwxyz"
-                              "0123456789+/";
-  std::string Res;
-  size_t I;
-  for (I = 0; I + 2 < Bytes.size(); I += 3) {
-    uint32_t X = (Bytes[I] << 16) + (Bytes[I + 1] << 8) + Bytes[I + 2];
-    Res += Table[(X >> 18) & 63];
-    Res += Table[(X >> 12) & 63];
-    Res += Table[(X >> 6) & 63];
-    Res += Table[X & 63];
+  std::string ret;
+  int i = 0;
+  int j = 0;
+  unsigned char char_array_3[3];
+  unsigned char char_array_4[4];
+
+  unsigned in_len = Bytes.size();
+  unsigned idx = 0;
+  while (in_len--) {
+    char_array_3[i++] = Bytes[idx++];
+    if (i == 3) {
+      char_array_4[0] = (char_array_3[0] & 0xfc) >> 2;
+      char_array_4[1] = ((char_array_3[0] & 0x03) << 4) +
+                        ((char_array_3[1] & 0xf0) >> 4);
+      char_array_4[2] = ((char_array_3[1] & 0x0f) << 2) +
+                        ((char_array_3[2] & 0xc0) >> 6);
+      char_array_4[3] = char_array_3[2] & 0x3f;
+
+      for(i = 0; (i <4) ; i++)
+        ret += base64_chars[char_array_4[i]];
+      i = 0;
+    }
   }
-  if (I + 1 == Bytes.size()) {
-    uint32_t X = (Bytes[I] << 16);
-    Res += Table[(X >> 18) & 63];
-    Res += Table[(X >> 12) & 63];
-    Res += "==";
-  } else if (I + 2 == Bytes.size()) {
-    uint32_t X = (Bytes[I] << 16) + (Bytes[I + 1] << 8);
-    Res += Table[(X >> 18) & 63];
-    Res += Table[(X >> 12) & 63];
-    Res += Table[(X >> 6) & 63];
-    Res += "=";
+
+  if (i)
+  {
+    for(j = i; j < 3; j++)
+      char_array_3[j] = '\0';
+
+    char_array_4[0] = ( char_array_3[0] & 0xfc) >> 2;
+    char_array_4[1] = ((char_array_3[0] & 0x03) << 4) +
+                      ((char_array_3[1] & 0xf0) >> 4);
+    char_array_4[2] = ((char_array_3[1] & 0x0f) << 2) +
+                      ((char_array_3[2] & 0xc0) >> 6);
+
+    for (j = 0; (j < i + 1); j++)
+      ret += base64_chars[char_array_4[j]];
+
+    while((i++ < 3))
+      ret += '=';
+
   }
-  return Res;
+
+  return ret;
 }
 
 void write32be(uint32_t I, llvm::raw_ostream &OS) {
@@ -344,13 +409,16 @@ std::vector<HighlightingToken> getSemanticHighlightings(ParsedAST &AST) {
   CollectExtraHighlightings(Builder).TraverseAST(C);
   // Highlight all decls and references coming from the AST.
   findExplicitReferences(C, [&](ReferenceLoc R) {
-    if (auto Kind = kindForReference(R))
-      Builder.addToken(R.NameLoc, *Kind);
+    if (auto Kind = kindForReference(R)) {
+      Builder.addToken(R.NameLoc, *Kind, symbolIDForReference(R));
+    }
   });
   // Add highlightings for macro references.
   for (const auto &SIDToRefs : AST.getMacros().MacroRefs) {
-    for (const auto &M : SIDToRefs.second)
-      Builder.addToken({HighlightingKind::Macro, M});
+    for (const auto &M : SIDToRefs.second) {
+      Builder.addToken({HighlightingKind::Macro, M,
+                  static_cast<unsigned>(hash_value(SIDToRefs.first))});
+    }
   }
   for (const auto &M : AST.getMacros().UnknownMacros)
     Builder.addToken({HighlightingKind::Macro, M});
@@ -471,7 +539,8 @@ bool operator==(const LineHighlightings &L, const LineHighlightings &R) {
 }
 
 std::vector<SemanticHighlightingInformation>
-toSemanticHighlightingInformation(llvm::ArrayRef<LineHighlightings> Tokens) {
+toSemanticHighlightingInformation(llvm::ArrayRef<LineHighlightings> Tokens,
+                                  bool ExtendWithSymbolIDs) {
   if (Tokens.size() == 0)
     return {};
 
@@ -487,10 +556,21 @@ toSemanticHighlightingInformation(llvm::ArrayRef<LineHighlightings> Tokens) {
       // LSP proposal. Described below.
       // |<---- 4 bytes ---->|<-- 2 bytes -->|<--- 2 bytes -->|
       // |    character      |  length       |    index       |
+      //
+      // Rainbow highlighting custom option:
+      // |<---- 4 bytes ---->|<-- 2 bytes -->|<-1 byte->|<-1 byte->|
+      // |    character      |  length       |  hash   |  index    |
 
       write32be(Token.R.start.character, OS);
       write16be(Token.R.end.character - Token.R.start.character, OS);
-      write16be(static_cast<int>(Token.Kind), OS);
+
+      if (ExtendWithSymbolIDs) {
+        write16be((static_cast<uint16_t>(Token.SymbolID) << 8) +
+                    static_cast<uint8_t>(Token.Kind),
+                  OS);
+      } else {
+        write16be(static_cast<int>(Token.Kind), OS);
+      }
     }
 
     Lines.push_back({Line.Line, encodeBase64(LineByteTokens), Line.IsInactive});
